@@ -1,0 +1,109 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2 # change to your preferred region
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      
+    - name: Run Lint Action
+      uses: ./.github/actions/lint-action
+      with:
+        python-version: '3.11'
+
+  create_bucket:
+    needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      bucket_name: ${{ steps.extract_bucket_name.outputs.bucket_name }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to AWS CloudFormation
+        uses: aws-actions/aws-cloudformation-github-deploy@v1
+        with:
+          name: lambda-bucket-stack
+          template: cfn/s3-template.yml
+          no-fail-on-empty-changeset: "1"
+      
+      - name: Extract Bucket Name
+        id: extract_bucket_name
+        run: |
+          BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name lambda-bucket-stack --query "Stacks[0].Outputs[?OutputKey=='LambdaCodeBucketName'].OutputValue" --output text)
+          echo "Bucket name is $BUCKET_NAME"
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+        
+  upload_lambda:
+    needs: create_bucket
+    runs-on: ubuntu-latest
+    env:
+      BUCKET_NAME: ${{ needs.create_bucket.outputs.bucket_name }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+        
+      - name: Zip and Upload Lambda functions
+        run: |
+          cd lambda
+          for dir in *; do
+            if [ -d "$dir" ]; then
+              cd $dir
+              
+              echo "Creating zip for $dir"
+              zip -r ../${dir}.zip .
+              
+              echo "Uploading ${dir}.zip to S3"
+              aws s3 cp ../${dir}.zip s3://${BUCKET_NAME}/${dir}.zip
+              cd ..
+            fi
+          done
+
+  create_app:
+    needs: upload_lambda
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to AWS CloudFormation
+        uses: aws-actions/aws-cloudformation-github-deploy@v1
+        with:
+          name: ecommerce-app-stack
+          template: cfn/ecommerce-template.yml
+          no-fail-on-empty-changeset: "1"  

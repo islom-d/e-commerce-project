@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create an S3 bucket for storing Lambda function code.'
+
+Parameters:
+  BucketName:
+    Description: 'The name of the S3 bucket to store Lambda function code.'
+    Type: 'String'
+    Default: 'ecommerce-application-lambda-code'
+
+Resources:
+  LambdaCodeBucket:
+    Type: 'AWS::S3::Bucket'
+    Description: 'S3 Bucket for storing Lambda function code.'
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: 'Enabled'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+  LambdaCodeBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action:
+              - 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${BucketName}/*'
+      Bucket: !Ref LambdaCodeBucket
+
+Outputs:
+  LambdaCodeBucketName:
+    Description: 'The name of the S3 bucket created to store Lambda functions code.'
+    Value: !Ref LambdaCodeBucket
+    Export:
+      Name: 'LambdaCodeBucketName'

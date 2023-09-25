@@ -1,0 +1,727 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: E-commerce Order Placement and Notification System
+
+Parameters:
+  ApiGatewayName:
+    Type: String
+    Default: orderApi
+  ApiGatewayStageName:
+    Type: String
+    AllowedPattern: '[a-z0-9]+'
+    Default: prod
+  ApiGatewayHTTPMethod:
+    Type: String
+    Default: GET
+  LambdaFunctionName:
+    Type: String
+    Default: OrderPlacementLambda
+  NotificationEmailName:
+    Type: String
+    Default: islombek@yahoo.com
+    Description: Email address to receive notifications
+
+Resources:
+#########################
+######## Task 1 #########
+#########################
+
+# Api Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: Example API Gateway
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: !Ref ApiGatewayName
+
+  ApiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: !Ref ApiGatewayHTTPMethod
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt OrderPlacementLambda.Arn
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref ApiGatewayStageName
+
+# Lambda
+  OrderPlacementLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: OrderPlacementLambda
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt OrderPlacementLambdaIAMRole.Arn
+      Runtime: python3.11
+      Code:
+        S3Bucket:
+          Fn::ImportValue: 'LambdaCodeBucketName'
+        S3Key: 'orderPlacementLambda.zip'
+
+  OrderPlacementLambdaApiGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OrderPlacementLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/${ApiGatewayStageName}/${ApiGatewayHTTPMethod}/
+
+  OrderPlacementLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*
+              - Effect: Allow
+                Action: 
+                  - sqs:SendMessage
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action: 
+                  - sns:Publish
+                Resource: !Ref OrderAlertsTopic
+          PolicyName: LambdaToApiGatewayExecutionPolicy
+
+  OrderPlacementLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaFunctionName}
+      RetentionInDays: 30
+
+# SQS
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "OrdersQueue"
+
+# SNS
+  OrderAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "OrderAlertsTopic"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmailName
+
+#########################
+######## Task 2 #########
+#########################
+
+# DynamoDB and Lambda resources to seed data
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: InventoryTable
+      AttributeDefinitions:
+        - AttributeName: ProductID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ProductID
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      
+  SeedInventoryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SeedInventoryLambda
+      Handler: index.handler
+      Role: !GetAtt SeedInventoryLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref InventoryTable
+      Code:
+        ZipFile: |
+          import json, os
+          import boto3
+          from decimal import Decimal
+          import cfnresponse
+
+          def handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table_name = os.environ.get('TABLE_NAME', 'InventoryTable') # Default to 'InventoryTable' if TABLE_NAME is not set
+              table = dynamodb.Table(table_name)
+              seed_data = [
+                  {"ProductID": "product001", "Name": "Product A", "Description": "Description of Product A", "Price": Decimal("19.99"), "Quantity": 100},
+                  {"ProductID": "product002", "Name": "Product B", "Description": "Description of Product B", "Price": Decimal("29.99"), "Quantity": 50},
+                  {"ProductID": "product003", "Name": "Product C", "Description": "Description of Product C", "Price": Decimal("9.99"), "Quantity": 200},
+                  {"ProductID": "product004", "Name": "Product D", "Description": "Description of Product D", "Price": Decimal("49.99"), "Quantity": 10},
+                  {"ProductID": "product005", "Name": "Product E", "Description": "Description of Product E", "Price": Decimal("39.99"), "Quantity": 75},
+              ]
+              with table.batch_writer() as batch:
+                  for item in seed_data:
+                      batch.put_item(Item=item)
+                      
+              responseData = {"Status": "Seed Data Inserted Successfully"}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+  SeedInventoryLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SeedInventoryLambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt InventoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  SeedInventoryTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SeedInventoryLambda.Arn
+      TableName: !Ref InventoryTable
+
+#Step Function with its resources
+  ValidateOrderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ValidateOrderLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 128
+      Runtime: python3.11
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref "InventoryTable"
+      Code:
+        S3Bucket:
+          Fn::ImportValue: 'LambdaCodeBucketName'
+        S3Key: 'validateOrderLambda.zip'
+
+  ProcessPaymentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessPaymentLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 128
+      Runtime: python3.11
+      Code:
+        S3Bucket:
+          Fn::ImportValue: 'LambdaCodeBucketName'
+        S3Key: 'processPaymentLambda.zip'
+                  
+  UpdateInventoryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UpdateInventoryLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 128
+      Runtime: python3.11
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref "InventoryTable"
+      Code:
+        S3Bucket:
+          Fn::ImportValue: 'LambdaCodeBucketName'
+        S3Key: 'updateInventoryLambda.zip'
+      
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: LambdaExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: 
+            - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ValidateOrderLambda:*"
+            - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ProcessPaymentLambda:*"
+            - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/UpdateInventoryLambda:*"
+          - Effect: Allow
+            Action:
+            - dynamodb:UpdateItem
+            - dynamodb:GetItem
+            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/InventoryTable"
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource: !Ref OrderErrorNotificationTopic
+
+  OrderProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: OrderProcessingStateMachine
+      DefinitionString: 
+        !Sub |
+          {
+            "Comment": "A state machine for processing e-commerce orders.",
+            "StartAt": "ValidateOrder",
+            "States": {
+              "ValidateOrder": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ValidateOrderLambda",
+                "Next": "ProcessPayment",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "OrderFailed"
+                  }
+                ]
+              },
+              "ProcessPayment": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ProcessPaymentLambda",
+                "Next": "UpdateInventory",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "OrderFailed"
+                  }
+                ]
+              },
+              "UpdateInventory": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:UpdateInventoryLambda",
+                "Next": "SendOrderConfirmationEvent",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "OrderFailed"
+                  }
+                ]
+              },
+            "SendOrderConfirmationEvent": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::events:putEvents",
+              "Parameters": {
+                "Entries": [
+                  {
+                    "Source": "custom.orderProcessing",
+                    "DetailType": "orderConfirmation",
+                    "Detail": {
+                      "productName.$": "$.productName",
+                      "quantity.$": "$.quantity",
+                      "totalPrice.$": "$.totalPrice"
+                    },
+                    "EventBusName": "default"
+                  }
+                ]
+              },
+              "End": true
+            },
+              "OrderFailed": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${OrderErrorNotificationTopic}",
+                  "Message.$": "$.Cause",
+                  "Subject": "Order Processing Error"
+                },
+                "End": true
+              }
+            }
+          }
+      RoleArn: !GetAtt StateMachineExecutionRole.Arn
+
+  StateMachineExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'states.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'StateMachineExecutionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt ValidateOrderLambda.Arn
+                  - !GetAtt ProcessPaymentLambda.Arn
+                  - !GetAtt UpdateInventoryLambda.Arn
+              - Effect: 'Allow'
+                Action: 
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/states/${AWS::StackName}:*"
+              - Effect: 'Allow'
+                Action: 'sns:Publish'
+                Resource: !Ref OrderErrorNotificationTopic
+              - Effect: 'Allow'
+                Action: 'events:PutEvents'
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+
+#Lambda function for starting State Machine
+  StartOrderProcessingLambda:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: StartOrderProcessingLambda
+        Handler: index.handler
+        Role: !GetAtt StartOrderProcessingLambdaExecutionRole.Arn
+        MemorySize: 128
+        Runtime: python3.11
+        Environment:
+          Variables:
+            STATE_MACHINE_ARN: !Ref OrderProcessingStateMachine
+        Code:
+          S3Bucket:
+            Fn::ImportValue: 'LambdaCodeBucketName'
+          S3Key: 'startOrderProcessingLambda.zip'
+
+  StartOrderProcessingLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: StartOrderProcessingLambdaExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/StartOrderProcessingLambda:*"
+          - Effect: Allow
+            Action:
+            - states:StartExecution
+            Resource: !GetAtt OrderProcessingStateMachine.Arn
+          - Effect: Allow
+            Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            Resource: !GetAtt OrdersQueue.Arn
+
+  StartOrderProcessingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt StartOrderProcessingLambda.Arn
+      Principal: sqs.amazonaws.com
+      SourceArn: !GetAtt OrdersQueue.Arn
+
+  StartOrderProcessingLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt OrdersQueue.Arn
+      FunctionName: !GetAtt StartOrderProcessingLambda.Arn
+      Enabled: true
+
+#SNS
+  OrderErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OrderErrorNotificationTopic
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmailName
+
+#########################
+######## Task 3 #########
+#########################
+
+#Eventbridge and lambda function for event handling
+  OrderConfirmationRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: 'OrderConfirmationRule'
+      EventPattern:
+        source:
+          - 'custom.orderProcessing'
+        detail-type:
+          - 'orderConfirmation'
+      State: 'ENABLED'
+      Targets:
+        - Id: 'OrderConfirmationTarget'
+          Arn: !GetAtt OrderSuccessHandlerLambda.Arn
+
+  OrderSuccessHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt OrderSuccessHandlerLambdaRole.Arn
+      FunctionName: OrderSuccessHandlerLambda
+      Runtime: python3.11
+      Code:
+        S3Bucket:
+          Fn::ImportValue: 'LambdaCodeBucketName'
+        S3Key: 'orderSuccessHandlerLambda.zip'
+
+  OrderSuccessHandlerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - events.amazonaws.com 
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/OrderSuccessHandlerLambda:*"
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt OrderSuccessHandlerLambda.Arn
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt OrderConfirmationRule.Arn 
+
+#########################
+######## Task 4 #########
+#########################
+
+#CloudWatch alarms
+  OrdersQueueDepthAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmName: "OrdersQueueDepthAlarm"
+      Namespace: "AWS/SQS"
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      TreatMissingData: "notBreaching"
+      Dimensions:
+        - Name: "QueueName"
+          Value: !GetAtt OrdersQueue.Arn 
+      Statistic: "Average"
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+
+
+  OrderProcessingWorkflowFailureAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmName: "OrderProcessingWorkflowFailureAlarm"
+      Namespace: "AWS/States"
+      MetricName: "ExecutionsFailed"
+      TreatMissingData: "notBreaching"
+      Dimensions:
+        - Name: "StateMachineArn"
+          Value: !Ref OrderProcessingStateMachine
+      Statistic: "Sum"
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      AlarmActions:
+        - !Ref OrderErrorNotificationTopic
+
+#CloudWatch Dashboard
+  CloudWatchDashboard:
+      Type: "AWS::CloudWatch::Dashboard"
+      Properties:
+          DashboardName: "EcommerceProcessingDashboard"
+          DashboardBody: !Sub |
+              {
+                  "widgets": [
+                      {
+                          "height": 10,
+                          "width": 17,
+                          "y": 0,
+                          "x": 0,
+                          "type": "metric",
+                          "properties": {
+                              "metrics": [
+                                  ["AWS/Lambda", "Errors", "FunctionName", "OrderPlacementLambda"],
+                                  [".", "Duration", ".", "."],
+                                  [".", "Invocations", ".", "."]
+                              ],
+                              "view": "timeSeries",
+                              "stacked": false,
+                              "region": "${AWS::Region}",
+                              "title": "OrderProcessing Lambda Metrics",
+                              "period": 300,
+                              "stat": "Sum",
+                              "start": "-PT3H"
+                          }
+                      },
+                      {
+                          "height": 9,
+                          "width": 17,
+                          "y": 10,
+                          "x": 0,
+                          "type": "metric",
+                          "properties": {
+                              "metrics": [
+                                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "OrdersQueue", {"stat": "Average", "region": "${AWS::Region}"}],
+                                  [".", "ApproximateAgeOfOldestMessage", ".", ".", {"stat": "Maximum", "region": "${AWS::Region}"}],
+                                  [".", "ApproximateNumberOfMessagesDelayed", ".", ".", {"stat": "Maximum", "region": "${AWS::Region}"}]
+                              ],
+                              "view": "timeSeries",
+                              "stacked": false,
+                              "region": "${AWS::Region}",
+                              "title": "SQS Metrics",
+                              "period": 300
+                          }
+                      },
+                      {
+                          "height": 10,
+                          "width": 17,
+                          "y": 19,
+                          "x": 0,
+                          "type": "metric",
+                          "properties": {
+                              "metrics": [
+                                  ["AWS/States", "ExecutionsStarted", "StateMachineArn", "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:OrderProcessingStateMachine", {"stat": "Sum", "region": "${AWS::Region}"}],
+                                  [".", "ExecutionsFailed", ".", ".", {"stat": "Sum", "region": "${AWS::Region}"}],
+                                  [".", "ExecutionsSucceeded", ".", ".", {"stat": "Sum", "region": "${AWS::Region}"}]
+                              ],
+                              "view": "timeSeries",
+                              "stacked": false,
+                              "region": "${AWS::Region}",
+                              "title": "Step Functions Metrics",
+                              "period": 300
+                          }
+                      },
+                      {
+                          "type": "alarm",
+                          "x": 17,
+                          "y": 0,
+                          "width": 7,
+                          "height": 2,
+                          "properties": {
+                              "title": "",
+                              "alarms": [
+                                  "arn:aws:cloudwatch:us-east-2:${AWS::AccountId}:alarm:OrderProcessingWorkflowFailureAlarm",
+                                  "arn:aws:cloudwatch:us-east-2:${AWS::AccountId}:alarm:OrdersQueueDepthAlarm"
+                              ]
+                          }
+                      },
+                      {
+                          "type": "metric",
+                          "x": 17,
+                          "y": 2,
+                          "width": 7,
+                          "height": 8,
+                          "properties": {
+                              "metrics": [
+                                  ["AWS/Lambda", "Invocations", "FunctionName", "OrderSuccessHandlerLambda", {"region": "us-east-2"}]
+                              ],
+                              "sparkline": true,
+                              "view": "singleValue",
+                              "region": "us-east-2",
+                              "title": "Successful Orders",
+                              "period": 300,
+                              "stat": "Sum"
+                          }
+                      },
+                      {
+                          "type": "metric",
+                          "x": 17,
+                          "y": 10,
+                          "width": 7,
+                          "height": 9,
+                          "properties": {
+                              "sparkline": true,
+                              "view": "singleValue",
+                              "metrics": [
+                                  ["AWS/SQS", "SentMessageSize", "QueueName", "OrdersQueue"]
+                              ],
+                              "region": "us-east-2"
+                          }
+                      }
+                  ]
+              }
+
+
+#########################
+######## Task 5 #########
+#########################
+
+#SNS
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "CriticalAlertsTopic"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmailName
+
+#Api Enpoint Output
+Outputs:
+  ApiGatewayInvokeURL:
+    Description: "URL to invoke the API Gateway"
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStageName}
